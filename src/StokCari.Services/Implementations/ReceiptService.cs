@@ -17,6 +17,9 @@ public class ReceiptService(AppDbContext db, IMapper mapper, ICurrentUser user, 
 
     public async Task<PagedResult<ReceiptDto>> ListAsync(ReceiptListQuery q, CancellationToken ct)
     {
+        
+        
+        
         var query = db.Receipts.AsNoTracking();
 
         if (q.Status.HasValue) query = query.Where(x => x.Status == q.Status.Value);
@@ -34,12 +37,12 @@ public class ReceiptService(AppDbContext db, IMapper mapper, ICurrentUser user, 
 
         query = (q.SortBy?.ToLowerInvariant(), q.Desc) switch
         {
-            ("number", false) => query.OrderBy(x => x.Series).ThenBy(x => x.Number),
-            ("number", true) => query.OrderByDescending(x => x.Series).ThenByDescending(x => x.Number),
+            ("number", false) => query.OrderBy(x => x.Series).ThenBy(x => x.Number).ThenBy(x => x.Id),
+            ("number", true) => query.OrderByDescending(x => x.Series).ThenByDescending(x => x.Number).ThenBy(x => x.Id),
             ("total", false) => query.OrderBy(x => x.TotalAmount).ThenBy(x => x.Id),
             ("total", true) => query.OrderByDescending(x => x.TotalAmount).ThenBy(x => x.Id),
-            ("date", false) => query.OrderBy(x => x.ReceiptDate).ThenBy(x => x.Number),
-            _ => query.OrderByDescending(x => x.ReceiptDate).ThenByDescending(x => x.Number) // varsayılan: en yeni önce
+            ("date", false) => query.OrderBy(x => x.ReceiptDate).ThenBy(x => x.Number).ThenBy(x => x.Id),
+            _ => query.OrderByDescending(x => x.ReceiptDate).ThenByDescending(x => x.Number).ThenBy(x => x.Id) // varsayılan: en yeni önce
         };
 
         var total = await query.CountAsync(ct);
@@ -54,7 +57,7 @@ public class ReceiptService(AppDbContext db, IMapper mapper, ICurrentUser user, 
         var entity = await db.Receipts.AsNoTracking().FirstOrDefaultAsync(x => x.Id == id, ct)
             ?? throw new NotFoundException("Fiş bulunamadı.");
 
-        return (await ToDtosAsync([entity], ct)).Single();
+        return await ToDtoAsync(entity, ct);
     }
 
     // ---------------------------------------------------------------- Oluşturma / düzenleme / silme (yalnızca Draft)
@@ -64,7 +67,7 @@ public class ReceiptService(AppDbContext db, IMapper mapper, ICurrentUser user, 
         var companyId = user.RequireCompanyId();
         user.RequireUserId();
 
-        await EnsureAccountAndStockExistAsync(request.AccountId, request.StockId, ct);
+        await ValidateReferencesAsync(request.AccountId, request.StockId, request.ReceiptDate, ct);
 
         var series = request.Series.Trim().ToUpperInvariant();
 
@@ -112,7 +115,7 @@ public class ReceiptService(AppDbContext db, IMapper mapper, ICurrentUser user, 
         }
 
         logger.LogInformation("Taslak fiş oluşturuldu {ReceiptId} {Series}-{Number}", entity.Id, entity.Series, entity.Number);
-        return (await ToDtosAsync([entity], ct)).Single();
+        return await ToDtoAsync(entity, ct);
     }
 
     public async Task<ReceiptDto> UpdateAsync(Guid id, UpdateReceiptRequest request, CancellationToken ct)
@@ -123,7 +126,7 @@ public class ReceiptService(AppDbContext db, IMapper mapper, ICurrentUser user, 
         if (entity.Status != ReceiptStatus.Draft)
             throw new ConflictException("Yalnızca taslak fiş düzenlenebilir.");
 
-        await EnsureAccountAndStockExistAsync(request.AccountId, request.StockId, ct);
+        await ValidateReferencesAsync(request.AccountId, request.StockId, request.ReceiptDate, ct);
 
         // Tür değiştirilemez: seri ve numara türe bağlıdır. Tür yanlışsa taslak silinip doğru seriyle yeniden oluşturulur.
         entity.AccountId = request.AccountId;
@@ -135,7 +138,7 @@ public class ReceiptService(AppDbContext db, IMapper mapper, ICurrentUser user, 
         entity.Description = request.Description?.Trim();
 
         await db.SaveChangesAsync(ct);
-        return (await ToDtosAsync([entity], ct)).Single();
+        return await ToDtoAsync(entity, ct);
     }
 
     public async Task DeleteAsync(Guid id, CancellationToken ct)
@@ -228,10 +231,9 @@ public class ReceiptService(AppDbContext db, IMapper mapper, ICurrentUser user, 
         logger.LogInformation("Fiş onayı tamamlandı (commit) {ReceiptId}", id);
 
         // Cache, commit'ten SONRA geçersiz kılınır.
-        await cache.InvalidateEntityAsync(CacheEntities.Stock, receipt.CompanyId, receipt.StockId);
-        await cache.InvalidateEntityAsync(CacheEntities.Account, receipt.CompanyId, receipt.AccountId);
+        await InvalidateCardsAsync(receipt);
 
-        return (await ToDtosAsync([receipt], ct)).Single();
+        return await ToDtoAsync(receipt, ct);
     }
 
     // ---------------------------------------------------------------- İptal
@@ -288,10 +290,9 @@ public class ReceiptService(AppDbContext db, IMapper mapper, ICurrentUser user, 
 
         logger.LogInformation("Fiş iptali tamamlandı (commit) {ReceiptId}", id);
 
-        await cache.InvalidateEntityAsync(CacheEntities.Stock, receipt.CompanyId, receipt.StockId);
-        await cache.InvalidateEntityAsync(CacheEntities.Account, receipt.CompanyId, receipt.AccountId);
+        await InvalidateCardsAsync(receipt);
 
-        return (await ToDtosAsync([receipt], ct)).Single();
+        return await ToDtoAsync(receipt, ct);
     }
 
     // ---------------------------------------------------------------- Yardımcılar
@@ -299,10 +300,14 @@ public class ReceiptService(AppDbContext db, IMapper mapper, ICurrentUser user, 
     private static decimal CalculateTotal(decimal quantity, decimal unitPrice) =>
         Math.Round(quantity * unitPrice, 2, MidpointRounding.AwayFromZero);
 
-    private async Task EnsureAccountAndStockExistAsync(Guid accountId, Guid stockId, CancellationToken ct)
+    private async Task ValidateReferencesAsync(Guid accountId, Guid stockId, DateOnly receiptDate, CancellationToken ct)
     {
+        // [Required] değer tiplerinde boş değeri yakalamaz; gönderilmeyen alanlar Guid.Empty / 0001-01-01 olarak gelir.
         if (accountId == Guid.Empty || stockId == Guid.Empty)
             throw new BadRequestException("Cari ve stok seçimi zorunludur.");
+
+        if (receiptDate == default)
+            throw new BadRequestException("Fiş tarihi zorunludur.");
 
         // Global query filter: yalnızca aynı şirketin, silinmemiş kartları görünür.
         if (!await db.Accounts.AnyAsync(a => a.Id == accountId, ct))
@@ -332,9 +337,23 @@ public class ReceiptService(AppDbContext db, IMapper mapper, ICurrentUser user, 
         return counter.LastNumber;
     }
 
+    /// <summary>Bakiyesi değişen stok ve cari kartlarının cache kayıtlarını siler. Commit'ten SONRA çağrılmalıdır.</summary>
+    private async Task InvalidateCardsAsync(Receipt receipt)
+    {
+        await cache.InvalidateEntityAsync(CacheEntities.Stock, receipt.CompanyId, receipt.StockId);
+        await cache.InvalidateEntityAsync(CacheEntities.Account, receipt.CompanyId, receipt.AccountId);
+    }
+
     private static bool IsSeriesConflict(DbUpdateException ex) =>
         ex is DbUpdateConcurrencyException ||
-        ex.InnerException is Npgsql.PostgresException { SqlState: Npgsql.PostgresErrorCodes.UniqueViolation, ConstraintName: "ux_receipt_series_company_series" };
+        ex.InnerException is Npgsql.PostgresException
+        {
+            SqlState: Npgsql.PostgresErrorCodes.UniqueViolation,
+            ConstraintName: "ux_receipts_company_series_number" or "ux_receipt_series_company_series"
+        };
+
+    private async Task<ReceiptDto> ToDtoAsync(Receipt receipt, CancellationToken ct) =>
+        (await ToDtosAsync([receipt], ct)).Single();
 
     /// <summary>
     /// Geçmiş fişlerde stok/cari adının görünmeye devam etmesi için kartlar IgnoreQueryFilters ile okunur

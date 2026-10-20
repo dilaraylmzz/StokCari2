@@ -144,14 +144,10 @@ public class AccountService(AppDbContext db, IMapper mapper, ICurrentUser user, 
         var account = await db.Accounts.AsNoTracking().FirstOrDefaultAsync(x => x.Id == id, ct)
             ?? throw new NotFoundException("Cari bulunamadı.");
 
-        // Yalnızca Approved fişlerin hareketleri sayılır. Borç (+), Alacak (-).
-        var debit = await db.EffectiveActTrans()
-            .Where(t => t.AccountId == id && t.Direction == TransDirection.Debit)
-            .SumAsync(t => t.Amount, ct);
-        var credit = await db.EffectiveActTrans()
-            .Where(t => t.AccountId == id && t.Direction == TransDirection.Credit)
-            .SumAsync(t => t.Amount, ct);
-        var calculated = debit - credit;
+        // Geçerli hareketler sayılır (fişsiz + Approved fişli). Borç (+), Alacak (-).
+        var calculated = await db.EffectiveActTrans()
+            .Where(t => t.AccountId == id)
+            .SumAsync(t => t.Direction == TransDirection.Debit ? t.Amount : -t.Amount, ct);
 
         return new BalanceCheckDto
         {

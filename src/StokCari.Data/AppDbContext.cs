@@ -19,6 +19,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentUser c
 
     /// <summary>Global query filter tarafından kullanılır (istek başına değerlendirilir).</summary>
     public Guid? CurrentCompanyId => currentUser.CompanyId;
+    
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {

@@ -178,7 +178,7 @@ try
             await db.Database.EnsureCreatedAsync();
     }
 
-    await DataSeeder.SeedAsync(app.Services, app.Configuration, app.Logger);
+    await DataSeeder.SeedAsync(app.Services, app.Configuration, app.Logger, app.Lifetime.ApplicationStopping);
 
     app.Run();
 }

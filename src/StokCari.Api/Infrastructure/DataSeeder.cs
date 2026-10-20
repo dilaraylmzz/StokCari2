@@ -12,7 +12,7 @@ namespace StokCari.Api.Infrastructure;
 /// </summary>
 public static class DataSeeder
 {
-    public static async Task SeedAsync(IServiceProvider services, IConfiguration config, ILogger logger)
+    public static async Task SeedAsync(IServiceProvider services, IConfiguration config, ILogger logger, CancellationToken ct = default)
     {
         using var scope = services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -21,18 +21,18 @@ public static class DataSeeder
         var adminUsername = config["Seed:AdminUsername"] ?? "admin";
         var adminPassword = config["Seed:AdminPassword"];
 
-        var adminExists = await db.Users.IgnoreQueryFilters().AnyAsync(u => u.Role == UserRole.Admin);
+        var adminExists = await db.Users.IgnoreQueryFilters().AnyAsync(u => u.Role == UserRole.Admin, ct);
         if (adminExists)
         {
             // Demo modu mevcut bir veritabanına sonradan açılırsa DEMO şirketinin varsayılan serilerini tamamla.
             if (config.GetValue<bool>("Seed:DemoData"))
             {
                 var demoCompany = await db.Companies.IgnoreQueryFilters()
-                    .FirstOrDefaultAsync(c => c.Code == "DEMO" && !c.IsDeleted);
+                    .FirstOrDefaultAsync(c => c.Code == "DEMO" && !c.IsDeleted, ct);
                 if (demoCompany is not null)
                 {
-                    await AddDefaultSeriesAsync(db, demoCompany.Id);
-                    await db.SaveChangesAsync();
+                    await AddDefaultSeriesAsync(db, demoCompany.Id, ct);
+                    await db.SaveChangesAsync(ct);
                 }
             }
 
@@ -55,7 +55,7 @@ public static class DataSeeder
         };
         admin.PasswordHash = hasher.HashPassword(admin, adminPassword);
         db.Users.Add(admin);
-        await db.SaveChangesAsync();
+        await db.SaveChangesAsync(ct);
         logger.LogInformation("Admin kullanıcısı oluşturuldu: {Username}", adminUsername);
 
         if (!config.GetValue<bool>("Seed:DemoData"))
@@ -65,7 +65,7 @@ public static class DataSeeder
 
         var company = new Company { Code = "DEMO", Name = "Demo Şirketi", TaxNumber = "1234567890", CreatedBy = admin.Id };
         db.Companies.Add(company);
-        await db.SaveChangesAsync();
+        await db.SaveChangesAsync(ct);
 
         var demoUser = new User
         {
@@ -81,20 +81,20 @@ public static class DataSeeder
 
         db.Stocks.Add(new Stock { CompanyId = company.Id, Code = "ELMA", Name = "Elma", Unit = "kg", UnitPrice = 20, CreatedBy = admin.Id });
         db.Accounts.Add(new Account { CompanyId = company.Id, Code = "AHMET", Name = "Ahmet", Type = AccountType.Customer, CreatedBy = admin.Id });
-        await AddDefaultSeriesAsync(db, company.Id);
+        await AddDefaultSeriesAsync(db, company.Id, ct);
 
-        await db.SaveChangesAsync();
+        await db.SaveChangesAsync(ct);
         logger.LogInformation("Demo verisi oluşturuldu (şirket DEMO, kullanıcı demo).");
     }
 
     /// <summary>Demo şirketine satış (SAT) ve alış (ALS) serilerini tanımlar; var olanları atlar.</summary>
-    private static async Task AddDefaultSeriesAsync(AppDbContext db, Guid companyId)
+    private static async Task AddDefaultSeriesAsync(AppDbContext db, Guid companyId, CancellationToken ct)
     {
         (string Series, ReceiptType Type)[] defaults = [("SAT", ReceiptType.Sale), ("ALS", ReceiptType.Purchase)];
 
         foreach (var (series, type) in defaults)
         {
-            if (!await db.ReceiptSeries.IgnoreQueryFilters().AnyAsync(s => s.CompanyId == companyId && s.Series == series))
+            if (!await db.ReceiptSeries.IgnoreQueryFilters().AnyAsync(s => s.CompanyId == companyId && s.Series == series, ct))
                 db.ReceiptSeries.Add(new ReceiptSeries { CompanyId = companyId, Series = series, Type = type, LastNumber = 0 });
         }
     }

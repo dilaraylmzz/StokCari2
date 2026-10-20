@@ -51,7 +51,9 @@ public class UserService(AppDbContext db, IMapper mapper, ICurrentUser currentUs
         await ValidateRoleAndCompanyAsync(request.Role, request.CompanyId, ct);
 
         var username = request.Username.Trim();
-        if (await db.Users.AnyAsync(x => x.Username.ToLower() == username.ToLower(), ct))
+        var usernameMatch = SearchHelper.Exact(username);
+        // Kullanıcı adı tüm sistemde benzersizdir; Admin X-Company-Id gönderdiğinde şirket filtresi diğer kullanıcıları gizlemesin.
+        if (await db.Users.IgnoreQueryFilters().AnyAsync(x => !x.IsDeleted && EF.Functions.ILike(x.Username, usernameMatch), ct))
             throw new ConflictException($"'{username}' kullanıcı adı zaten kullanılıyor.");
 
         var entity = new User

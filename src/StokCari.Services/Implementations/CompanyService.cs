@@ -46,7 +46,7 @@ public class CompanyService(AppDbContext db, IMapper mapper) : ICompanyService
     public async Task<CompanyDto> CreateAsync(CompanyRequest request, CancellationToken ct)
     {
         var code = request.Code.Trim();
-        if (await db.Companies.AnyAsync(x => x.Code == code, ct))
+        if (await CodeExistsAsync(code, excludeId: null, ct))
             throw new ConflictException($"'{code}' kodlu bir şirket zaten var.");
 
         var entity = new Company
@@ -68,7 +68,7 @@ public class CompanyService(AppDbContext db, IMapper mapper) : ICompanyService
             ?? throw new NotFoundException("Şirket bulunamadı.");
 
         var code = request.Code.Trim();
-        if (code != entity.Code && await db.Companies.AnyAsync(x => x.Code == code && x.Id != id, ct))
+        if (code != entity.Code && await CodeExistsAsync(code, excludeId: id, ct))
             throw new ConflictException($"'{code}' kodlu bir şirket zaten var.");
 
         entity.Code = code;
@@ -99,4 +99,12 @@ public class CompanyService(AppDbContext db, IMapper mapper) : ICompanyService
         db.Companies.Remove(entity); // interceptor soft delete'e çevirir
         await db.SaveChangesAsync(ct);
     }
+
+    /// <summary>
+    /// Şirket kodu tüm sistemde benzersizdir. Admin X-Company-Id gönderdiğinde şirket filtresi diğer şirketleri
+    /// gizleyeceği için filtreler kapatılıp silinmemiş kayıtlar açıkça sorgulanır.
+    /// </summary>
+    private Task<bool> CodeExistsAsync(string code, Guid? excludeId, CancellationToken ct) =>
+        db.Companies.IgnoreQueryFilters()
+            .AnyAsync(x => !x.IsDeleted && x.Code == code && x.Id != excludeId, ct);
 }

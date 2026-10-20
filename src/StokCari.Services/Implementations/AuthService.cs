@@ -13,7 +13,9 @@ public class AuthService(AppDbContext db, ITokenService tokens, ILogger<AuthServ
     public async Task<LoginResponse> LoginAsync(LoginRequest request, CancellationToken ct)
     {
         // Silinmiş kullanıcılar global query filter ile zaten dışarıda kalır.
-        var user = await db.Users.FirstOrDefaultAsync(u => u.Username.ToLower() == request.Username.ToLower(), ct);
+        // ILIKE: ToLower() mevcut kültürde (ör. Türkçe I/ı) SQL LOWER() ile örtüşmeyebilir.
+        var usernameMatch = SearchHelper.Exact(request.Username);
+        var user = await db.Users.FirstOrDefaultAsync(u => EF.Functions.ILike(u.Username, usernameMatch), ct);
 
         if (user is null || !user.IsActive || !PasswordHelper.Verify(user, request.Password))
         {

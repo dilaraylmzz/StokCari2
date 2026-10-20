@@ -16,9 +16,15 @@ internal static class PasswordHelper
 
 internal static class SearchHelper
 {
+    /// <summary>ILIKE joker karakterlerini kaçırır.</summary>
+    public static string Escape(string text) =>
+        text.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_");
+
     /// <summary>ILIKE deseni oluşturur; kullanıcı girdisindeki %, _ ve \ karakterleri kaçırılır.</summary>
-    public static string Pattern(string text) =>
-        "%" + text.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_") + "%";
+    public static string Pattern(string text) => "%" + Escape(text) + "%";
+
+    /// <summary>Büyük/küçük harf duyarsız tam eşleşme (ILIKE, jokersiz).</summary>
+    public static string Exact(string text) => Escape(text);
 }
 
 internal static class PagingExtensions
