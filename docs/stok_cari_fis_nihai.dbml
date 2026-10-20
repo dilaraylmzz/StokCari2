@@ -1,0 +1,248 @@
+// =======================================================
+// STOK, CARİ VE FİŞ YÖNETİM SİSTEMİ (NİHAİ ER DİYAGRAMI)
+// Çoklu Şirket (Multi-Tenant) & Hareket Tabanlı (Ledger) Mimari
+// =======================================================
+// Veritabanı: PostgreSQL. Tipler PostgreSQL karşılıklarıyla yazılmıştır.
+// Genel kurallar:
+// - Enum kullanılmaz; sabit değerler varchar(20) kolonlarda metin olarak tutulur (EF Core: HasConversion<string>()).
+// - Tüm Id ve yabancı anahtar kolonları GUID (uuid) tipindedir.
+//   Id'ler uygulamada üretilir (Guid.CreateVersion7() - sıralı GUID).
+// - Soft delete: is_deleted, deleted_at, deleted_by. Silme isteği kaydı fiziksel silmez, işaretler.
+//   Hareket tabloları (stock_trans, act_trans) ve sayaç tablosu (receipt_series) hariçtir.
+// - Fiş tek kalem içerir (receipt_lines kullanılmaz): stok, miktar ve birim fiyat doğrudan receipts üzerindedir.
+// - DBML filtreli indeksi desteklemez. Tüm unique indeksler (companies.code, users.username, stocks/accounts code,
+//   receipts series+number) EF Core'da HasFilter("is_deleted = false") ile oluşturulur; silinmiş kaydın kodu yeniden kullanılabilir.
+// - Silmeyi tek yerde yakalamak için SaveChanges interceptor kullanılır (Delete -> is_deleted, deleted_at, deleted_by).
+// - Silinmiş kayıtlar global query filter ile gizlenir. Geçmiş fiş sorgularında stok ve cari adı için IgnoreQueryFilters() kullanılır.
+// - Silme sonrası Redis anahtarları commit'ten sonra geçersiz kılınır; silinmiş kaydın detayı 404 döner.
+// - Hareket tabloları salt eklenir (append-only): yazıldıktan sonra güncellenmez ve silinmez.
+//   İptalde yeni hareket üretilmez; hareketin geçerliliği bağlı olduğu fişin status değerinden belirlenir.
+//   Hareket yalnızca receipts.status = 'Approved' ise geçerlidir. İptalde bakiyeler aynı transaction'da geri alınır.
+
+// -------------------------------------------------------
+// 1. KİRACI VE YETKİ YÖNETİMİ
+// -------------------------------------------------------
+
+Table companies {
+  id uuid [pk]
+  code varchar(50) [not null]
+  name varchar(200) [not null]
+  tax_no varchar(20)
+  is_active boolean [not null, default: true]
+  is_deleted boolean [not null, default: false]
+  deleted_at timestamptz
+  deleted_by uuid
+  created_at timestamptz [not null]
+  created_by uuid [note: 'Seed kayıtlarında boş olabilir']
+  updated_at timestamptz
+  updated_by uuid
+
+  indexes {
+    code [unique, name: 'ux_companies_code']
+  }
+
+  Note: 'Ana kiracı (tenant). Tüm veriler bu Id üzerinden izole edilir. SİLME KURALI: Aktif kullanıcısı veya Draft fişi varsa silinemez. Silinen şirketin kullanıcıları giriş yapamaz (giriş kontrolünde şirketin silinmemiş olması aranır).'
+}
+
+Table users {
+  id uuid [pk]
+  company_id uuid [note: 'Role = User ise zorunlu, Admin için NULL']
+  username varchar(100) [not null]
+  email varchar(255) [not null]
+  password_hash varchar(500) [not null]
+  role varchar(20) [not null, default: 'User', note: 'Admin, User']
+  is_active boolean [not null, default: true]
+  is_deleted boolean [not null, default: false]
+  deleted_at timestamptz
+  deleted_by uuid
+  created_at timestamptz [not null]
+  created_by uuid [note: 'Seed kayıtlarında boş olabilir']
+  updated_at timestamptz
+  updated_by uuid
+
+  indexes {
+    username [unique, name: 'ux_users_username']
+    company_id [name: 'ix_users_company']
+  }
+
+  Note: 'CHECK kısıtı: role = Admin veya company_id IS NOT NULL. SİLME KURALI: Silinen kullanıcı giriş yapamaz; created_by, updated_by ve approved_by kayıtları korunur.'
+}
+
+// -------------------------------------------------------
+// 2. KART TANIMLARI (STOK VE CARİ)
+// -------------------------------------------------------
+
+Table stocks {
+  id uuid [pk]
+  company_id uuid [not null]
+  code varchar(50) [not null]
+  name varchar(200) [not null]
+  unit varchar(20) [not null, note: 'kg, adet, metre vb.']
+  unit_price decimal(18,2) [not null, default: 0]
+  balance decimal(18,3) [not null, default: 0, note: 'Net stok bakiyesi (stock_trans toplamı)']
+  xmin xid [not null, note: 'PostgreSQL sistem kolonu: Optimistic Concurrency (EF Core: uint RowVersion)']
+  is_deleted boolean [not null, default: false]
+  deleted_at timestamptz
+  deleted_by uuid
+  created_at timestamptz [not null]
+  created_by uuid [not null]
+  updated_at timestamptz
+  updated_by uuid
+
+  indexes {
+    (company_id, code) [unique, name: 'ux_stocks_company_code']
+  }
+
+  Note: 'SİLME KURALI: Draft fişte kullanılıyorsa veya balance sıfır değilse silinemez. Onaylı fişlerde kullanılmış olması engel değildir (geçmiş fişlerde adı gösterilmeye devam eder).'
+}
+
+Table accounts {
+  id uuid [pk]
+  company_id uuid [not null]
+  code varchar(50) [not null]
+  name varchar(200) [not null]
+  type varchar(20) [not null, note: 'Customer (müşteri), Supplier (tedarikçi)']
+  tax_no varchar(20)
+  phone varchar(30)
+  email varchar(200)
+  address varchar(500)
+  balance decimal(18,2) [not null, default: 0, note: 'Borç (+) / Alacak (-) bakiyesi']
+  xmin xid [not null, note: 'PostgreSQL sistem kolonu: Optimistic Concurrency (EF Core: uint RowVersion)']
+  is_deleted boolean [not null, default: false]
+  deleted_at timestamptz
+  deleted_by uuid
+  created_at timestamptz [not null]
+  created_by uuid [not null]
+  updated_at timestamptz
+  updated_by uuid
+
+  indexes {
+    (company_id, code) [unique, name: 'ux_accounts_company_code']
+  }
+
+  Note: 'SİLME KURALI: Draft fişte kullanılıyorsa veya balance sıfır değilse silinemez. Onaylı fişlerde kullanılmış olması engel değildir (geçmiş fişlerde adı gösterilmeye devam eder).'
+}
+
+// -------------------------------------------------------
+// 3. FİŞ YÖNETİMİ
+// -------------------------------------------------------
+
+Table receipt_series {
+  id uuid [pk]
+  company_id uuid [not null]
+  series varchar(10) [not null]
+  type varchar(20) [not null, note: 'Bu seriyle kesilebilecek fiş türü: Sale, Purchase']
+  last_number int [not null, default: 0, note: 'Şirketin tanımladığı seri için otomatik ardışık numaratör; seri tanımları silinmez']
+
+  indexes {
+    (company_id, series) [unique, name: 'ux_receipt_series_company_series']
+  }
+
+  Note: 'Şirket bazında Admin tarafından tanımlanan fiş serisi ve sayaç tablosudur. Fiş oluşturma yalnızca burada tanımlı ve fişin türüne ait serileri kabul eder. Soft delete uygulanmaz; geçmiş numaralar korunur.'
+}
+
+Table receipts {
+  id uuid [pk]
+  company_id uuid [not null]
+  account_id uuid [not null]
+  stock_id uuid [not null]
+  type varchar(20) [not null, note: 'Sale (stok çıkış, cari borç), Purchase (stok giriş, cari alacak)']
+  status varchar(20) [not null, default: 'Draft', note: 'Draft, Approved, Cancelled']
+  series varchar(10) [not null]
+  number int [not null]
+  receipt_date date [not null]
+  quantity decimal(18,3) [not null, note: 'Miktar > 0']
+  unit_price decimal(18,2) [not null, note: 'Birim fiyat > 0']
+  total_amount decimal(18,2) [not null, note: 'quantity x unit_price']
+  description varchar(500)
+  approved_at timestamptz
+  approved_by uuid
+  cancelled_at timestamptz
+  cancelled_by uuid
+  is_deleted boolean [not null, default: false]
+  deleted_at timestamptz
+  deleted_by uuid
+  created_at timestamptz [not null]
+  created_by uuid [not null]
+  updated_at timestamptz
+  updated_by uuid
+
+  indexes {
+    (company_id, series, number) [unique, name: 'ux_receipts_company_series_number']
+    (company_id, receipt_date) [name: 'ix_receipts_company_date']
+    (company_id, account_id) [name: 'ix_receipts_company_account']
+    stock_id [name: 'ix_receipts_stock']
+  }
+
+  Note: 'SİLME KURALI: Yalnızca Draft fiş silinebilir. Approved fiş iptal edilir (silinemez), Cancelled fiş kapanmış kayıttır (silinemez). Durum geçişleri: Draft > Approved > Cancelled; iptal geri alınamaz. Draft: bakiye ve hareket etkilenmez. Approved: hareketler yazılır, bakiye güncellenir. Cancelled: hareketler geçersiz sayılır (silinmez), stok ve cari bakiyesi aynı transaction içinde geri alınır.'
+}
+
+// -------------------------------------------------------
+// 4. HAREKET TABLOLARI (LEDGER & AUDIT TRAIL)
+// -------------------------------------------------------
+
+Table stock_trans {
+  id uuid [pk]
+  company_id uuid [not null]
+  stock_id uuid [not null]
+  receipt_id uuid [null, note: 'Fişsiz harekette boş']
+  quantity decimal(18,3) [not null, note: 'Pozitif miktar (> 0); yön direction alanındadır']
+  direction varchar(20) [not null, note: 'In (giriş), Out (çıkış)']
+  trans_date date [not null]
+  created_at timestamptz [not null]
+  created_by uuid [not null]
+
+  indexes {
+    (company_id, stock_id, trans_date) [name: 'ix_stock_trans_company_stock_date']
+    receipt_id [name: 'ix_stock_trans_receipt']
+  }
+
+  Note: 'Salt eklenir. Geçerli hareket: bağlı fişin status değeri Approved olanlar.'
+}
+
+Table act_trans {
+  id uuid [pk]
+  company_id uuid [not null]
+  account_id uuid [not null]
+  receipt_id uuid [null, note: 'Fişsiz harekette boş']
+  amount decimal(18,2) [not null, note: 'Pozitif tutar; yön direction alanındadır']
+  direction varchar(20) [not null, note: 'Debit (borç), Credit (alacak)']
+  trans_date date [not null]
+  created_at timestamptz [not null]
+  created_by uuid [not null]
+
+  indexes {
+    (company_id, account_id, trans_date) [name: 'ix_act_trans_company_account_date']
+    receipt_id [name: 'ix_act_trans_receipt']
+  }
+
+  Note: 'Salt eklenir. Geçerli hareket: bağlı fişin status değeri Approved olanlar.'
+}
+
+// =======================================================
+// İLİŞKİLER (RELATIONSHIPS)
+// =======================================================
+
+// Şirket İzolasyonu
+Ref: companies.id < users.company_id
+Ref: companies.id < stocks.company_id
+Ref: companies.id < accounts.company_id
+Ref: companies.id < receipt_series.company_id
+Ref: companies.id < receipts.company_id
+Ref: companies.id < stock_trans.company_id
+Ref: companies.id < act_trans.company_id
+
+// Fiş Bağlantıları (Cari ve Stok)
+Ref: accounts.id < receipts.account_id
+Ref: stocks.id < receipts.stock_id
+
+// Fiş Onay / İptal Yetkilisi
+Ref: users.id < receipts.approved_by
+Ref: users.id < receipts.cancelled_by
+
+// Hareket Kayıtları (Ledger Bağlantıları)
+Ref: stocks.id < stock_trans.stock_id
+Ref: receipts.id < stock_trans.receipt_id
+
+Ref: accounts.id < act_trans.account_id
+Ref: receipts.id < act_trans.receipt_id

@@ -1,0 +1,9 @@
+bin/
+obj/
+.vs/
+.idea/
+*.user
+logs/
+*.log
+appsettings.Production.json
+secrets.json

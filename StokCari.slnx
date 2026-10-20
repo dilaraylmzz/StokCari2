@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/StokCari.Api/StokCari.Api.csproj" />
+    <Project Path="src/StokCari.Core/StokCari.Core.csproj" />
+    <Project Path="src/StokCari.Data/StokCari.Data.csproj" />
+    <Project Path="src/StokCari.Services/StokCari.Services.csproj" />
+  </Folder>
+</Solution>
